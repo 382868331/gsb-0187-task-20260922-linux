@@ -58,6 +58,9 @@ __all__ = [
     "verify_layout",
     "render_layout",
     "oriented_cells",
+    "CutSegment",
+    "CutPlan",
+    "generate_cut_segments",
 ]
 
 # ---------------------------------------------------------------------------
@@ -908,3 +911,13 @@ def render_layout(
             if 0 <= gx < board.width and 0 <= gy < height:
                 grid[gy][gx] = ch
     return "\n".join("".join(row) for row in reversed(grid))
+
+
+# ---------------------------------------------------------------------------
+# 切割段生成(对已有合法排样结果的后处理)
+#
+# 在模块末尾导入: nesting2d.cutting 复用上面已定义的 Board/Part/
+# Placement/oriented_cells 等; 原有的公开入口与行为完全不变。
+# ---------------------------------------------------------------------------
+
+from .cutting import CutPlan, CutSegment, generate_cut_segments  # noqa: E402
