@@ -18,12 +18,31 @@
   禁放格只禁止被零件格子覆盖, 不参与边距膨胀(可贴边、可落入零件孔洞)。
 - **使用高度** `h`: 只使用板材底部 `h` 行(`0 ≤ y < h`), `1 ≤ h ≤ height`。
 
+### 固定放置约束(锁定件)
+
+调用方可通过 `pack(..., fixed=[FixedPlacement(...)])` 锁定一部分零件,
+指定其零件下标、锚点、旋转角与是否镜像:
+
+```python
+FixedPlacement(part_index, x, y, rotation_degrees=0, mirrored=False)
+```
+
+- 锁定项在**任何搜索开始之前**逐项校验: 下标唯一且在范围内、锚点非负、
+  旋转角合法且属于该零件的允许集合、镜像被零件与全局开关同时允许、
+  形状格在板内、不覆盖禁放格、**锁定项两两之间不重叠且保留一格边距**。
+  任一不满足直接抛 `TypeError`/`InvalidSpecError`(消息含 `fixed[k]` 路径)。
+- 校验通过后锁定件作为预置占用, **优化器只安排剩余零件, 绝不会把锁定件
+  移开后再给一个"更好的解"**; 全部零件都锁定时零搜索即报最优。
+- 两块同形件只锁一块时, 锁定身份受保护: 去对称只在**可移动件内部**进行,
+  锁定件绝不与自由件交换。
+
 ### 优化目标(按优先级)
 
-1. 最小化使用高度 `h`;
-2. 最小化旋转次数 `rotation_count` = 放置方向旋转角 ≠ 0 的零件个数
-   (镜像不计入旋转次数);
-3. 最小化布局坐标字典序: 按零件下标比较每个零件的
+1. 最小化使用高度 `h`; **高度包含固定件的最高占用**(固定件锁在高处时,
+   高度下界随之抬高);
+2. 最小化旋转次数 `rotation_count` = 放置方向旋转角 ≠ 0 的
+   **可移动零件**个数(锁定件与镜像均不计入);
+3. 最小化**完整布局**(含锁定件)的坐标字典序: 按零件下标比较每个零件的
    `(x, y, (rotation_degrees, mirrored))`。
 
 坐标系: `(x, y)`, `0 ≤ x < width`, `0 ≤ y < height`, y 向上。
@@ -32,7 +51,8 @@
 ## 接口
 
 ```python
-from nesting2d import Board, Part, pack, Status, verify_layout, render_layout
+from nesting2d import Board, Part, FixedPlacement, pack, Status
+from nesting2d import verify_layout, render_layout
 
 board = Board(5, 5, forbidden=[(4, 3)])
 parts = [
@@ -43,11 +63,17 @@ parts = [
 res = pack(board, parts, budget=1_000_000, allow_reflection=True)
 res.status          # Status.OPTIMAL / INFEASIBLE / BUDGET_EXHAUSTED
 res.height          # 最优(或最优已知)高度; 无可行解为 None
-res.placements      # tuple[Placement], 按零件下标排序
+res.placements      # tuple[Placement], 按零件下标排序(含锁定件)
 res.layout          # dict: part_index -> (x, y, rotation_degrees, mirrored)
-res.rotation_count  # 旋转次数
+res.rotation_count  # 旋转次数(只统计可移动件)
 res.lower_bound     # 已证明的下界(见下)
 res.nodes, res.budget
+
+# 锁定: 零件 0 必须以 90 度放在锚点 (0,0); 优化器只安排零件 1/2
+res2 = pack(board, parts, fixed=[FixedPlacement(0, 0, 0, 90)])
+# 核验结果布局尊重锁定要求(额外返回问题描述, 空 = 一致)
+verify_layout(board, parts, res2.placements, res2.height,
+              fixed=[FixedPlacement(0, 0, 0, 90)])
 ```
 
 辅助函数:
@@ -66,7 +92,8 @@ res.nodes, res.budget
 | `INFEASIBLE` | 已证明任何高度(≤ 板高)都不可行 | `None` | `board.height + 1` |
 | `BUDGET_EXHAUSTED` | 预算耗尽, **不假装最优** | 最优已知解(可能 `None`) | 已证明的下界 |
 
-下界 = max(1, ⌈总面积/板宽⌉, 各零件最小包围盒高度的最大值)。
+下界 = max(1, ⌈总面积/板宽⌉, 各**可移动**零件最小包围盒高度的最大值,
+固定件最高占用)。
 `budget` 以 DFS 节点数计, 所有高度的搜索共享同一预算; 耗尽时 `nodes`
 为实际访问计数(可能等于 `budget + 1`, 触发中止的节点也计入)。
 
@@ -78,7 +105,9 @@ res.nodes, res.budget
   **NaN/Infinity**、非 bool 的开关参数、错误容器类型等;
 - `InvalidSpecError(ValueError)`: 取值域违规 —— 板尺寸超出 `[1, 20]`、
   零件为空/重复格/不连通/超过 12 格/超过 12 件、旋转角非 `0/90/180/270`、
-  空旋转集、禁放格越界或重复、`budget < 1` 等。
+  空旋转集、禁放格越界或重复、`budget < 1`、锁定项下标越界/重复、
+  锁定旋转不被允许、锁定镜像被禁用、锚点为负、锁定后越界或覆盖禁放格、
+  锁定项之间重叠或边距不足一格等。
 
 `Part`/`Board` 在构造时(`__post_init__)完成全部校验并归一化为不可变
 `frozenset`, 之后 `pack` 不会修改输入; 求解过程无可变全局状态,
@@ -87,13 +116,18 @@ res.nodes, res.budget
 ## 运行
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试(约 0.1 s)
-python demo.py                            # 演示(约 1 s, 真实计算)
+./.venv/bin/python -m unittest discover -s tests -v   # 必要测试(约 0.1 s)
+./.venv/bin/python demo.py                            # 演示(约 1 s, 真实计算)
 ```
+
+无 `.venv` 时, 任意满足 3.14.x 的系统 Python 3 亦可直接用
+`python3 -m unittest discover -s tests -v` 与 `python3 demo.py`
+(纯标准库, 无需安装依赖)。
 
 `demo.py` 使用固定输入, 打印: 一个正常算例的字符布局与最优性状态、
 实际触发的输入拒绝(不连通零件/越界禁放格/bool 参数)、
-以及实际触发的预算耗尽(与最优/无解状态对比)。
+实际触发的预算耗尽(与最优/无解状态对比),
+以及固定放置约束(两道锁定竖墙夹窄洞 + 锁定旋转不合法被拒绝)。
 
 ## 设计取舍
 
@@ -103,10 +137,14 @@ python demo.py                            # 演示(约 1 s, 真实计算)
   (未镜像优先, 再按旋转角); 形状且允许方向完全相同的零件归为一组,
   搜索时同组候选下标单调不减以破缺对称。注意: 形状相同但允许旋转集不同
   的零件**不**同组(旋转次数目标不同, 不可互换)。
+- **锁定件作为预置占用**: 锁定项先于搜索完成全部校验并物化为两个位掩码
+  (占用 + 膨胀), DFS 根节点直接以其为并集初值 —— 可移动候选与锁定件的
+  冲突检查和"已放置零件"走同一条 O(1) 位运算路径, 锁定件不存在被移动的
+  代码路径。锁定件不进任何对称交换组; 全部锁定时零搜索即证最优。
 - **两阶段驱动**: 利用可行性关于高度的单调性 —— 先在整板高度下贪心取
   任一可行解(首叶即停, 同时整板不可行 ⇔ 整体不可行), 再从下界向上逐高度
   完整枚举, 首次完整枚举成功的高度即最优高度, 该高度的枚举同时完成
-  旋转次数与字典序的次序优化。
+  旋转次数(只计可移动件)与完整布局字典序的次序优化。
 - **MRV + 截断扫描**: 每节点选择可行候选最少的零件组; 扫描带计数截断。
 - **预算语义**: 单一计数器贯穿所有阶段; 耗尽即抛内部异常并汇报
   最优已知解与下界, 绝不把未证明结果标记为 `OPTIMAL`/`INFEASIBLE`。

@@ -67,15 +67,32 @@ def placements_at_height(shape, width, height, forbidden):
     return out
 
 
-def solve(board, parts, allow_reflection: bool = True):
+def solve(board, parts, allow_reflection: bool = True, fixed=None):
     """穷举求解。board/parts 为 nesting2d 的 Board/Part(只读其公开字段)。
 
+    fixed: 可选的锁定放置, 形如 {part_index: (x, y, rot, mirrored)} 或
+    (part_index, x, y, rot, mirrored) 的序列(独立于被测核心解析, 只接受
+    普通 int/bool/tuple, 不依赖 nesting2d.FixedPlacement)。锁定零件只保留
+    其唯一指定候选; 锁定候选非法(板内/禁放格/互相冲突)时该高度无候选。
+
     返回 (height, rotation_count, lex_key, layout) 或 None(不可行)。
-    layout: tuple of (x, y, rot, mirrored), 按零件下标排序。
+    rotation_count 只统计未锁定零件; layout 按零件下标排序, 含锁定件。
     """
     width, max_h = board.width, board.height
     forbidden = set(board.forbidden)
     n = len(parts)
+
+    fixed_map = {}
+    if fixed is not None:
+        if isinstance(fixed, dict):
+            fixed_iter = ((i, v) for i, v in fixed.items())
+        else:
+            fixed_iter = (
+                (v[0], v[1:]) for v in fixed
+            )
+        for i, v in fixed_iter:
+            fixed_map[int(i)] = (int(v[0]), int(v[1]), int(v[2]), bool(v[3]))
+
     ori_list = [
         orientations(p.cells, p.rotations, allow_reflection and p.allow_reflection)
         for p in parts
@@ -85,13 +102,40 @@ def solve(board, parts, allow_reflection: bool = True):
     for h in range(1, max_h + 1):
         # 每个零件在该高度下的全部候选: (x, y, rot, mirrored, cells)
         cand_per_part: List[List[Tuple]] = []
-        for ori in ori_list:
+        fixed_conflict = False
+        for pi, ori in enumerate(ori_list):
             cands = []
-            for shape, (rot, mir) in ori.items():
-                for x, y, placed in placements_at_height(shape, width, h, forbidden):
-                    cands.append((x, y, rot, mir, placed))
+            if pi in fixed_map:
+                fx, fy, frot, fmir = fixed_map[pi]
+                part = parts[pi]
+                # 独立判定锁定方向是否被允许(不查去重后的 ori 字典:
+                # 镜像可能与某旋转几何同余, 但调用方指定的 rot/mir 元组
+                # 本身必须合法 —— 与被测核心的锁定校验口径一致)。
+                allowed = (
+                    frot in part.rotations
+                    and (not fmir or (allow_reflection and part.allow_reflection))
+                )
+                if not allowed:
+                    fixed_conflict = True
+                else:
+                    shape = transform(part.cells, frot, fmir)
+                    sw = max(x for x, _ in shape) + 1
+                    sh = max(y for _, y in shape) + 1
+                    if 0 <= fx and 0 <= fy and fx + sw <= width and fy + sh <= h:
+                        placed = tuple(
+                            sorted((cx + fx, cy + fy) for cx, cy in shape)
+                        )
+                        if not any(c in forbidden for c in placed):
+                            cands.append((fx, fy, frot, fmir, placed))
+                    # 越界/覆盖禁放格 => 无候选, 该高度不可行
+            else:
+                for shape, (rot, mir) in ori.items():
+                    for x, y, placed in placements_at_height(
+                        shape, width, h, forbidden
+                    ):
+                        cands.append((x, y, rot, mir, placed))
             cand_per_part.append(cands)
-        if any(not c for c in cand_per_part):
+        if fixed_conflict or any(not c for c in cand_per_part):
             continue
         chosen: List[Optional[Tuple]] = [None] * n
         best_key_at_h: List[Optional[Tuple]] = [None]
@@ -120,7 +164,9 @@ def solve(board, parts, allow_reflection: bool = True):
                 if not ok:
                     continue
                 chosen[i] = cand
-                bt(i + 1, rot_cost + (1 if cand[2] != 0 else 0))
+                # 第二目标只统计本次可移动(未锁定)零件的旋转
+                add_cost = i not in fixed_map and cand[2] != 0
+                bt(i + 1, rot_cost + (1 if add_cost else 0))
                 chosen[i] = None
 
         bt(0, 0)

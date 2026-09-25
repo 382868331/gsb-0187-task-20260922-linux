@@ -3,13 +3,16 @@
 演示内容:
 1. 一个正常排样算例(含禁放格), 打印字符布局与最优性状态;
 2. 一个实际触发的输入拒绝(不连通零件 -> InvalidSpecError);
-3. 一个实际触发的搜索预算耗尽(与证明无解/最优严格区分)。
+3. 一个实际触发的搜索预算耗尽(与证明无解/最优严格区分);
+4. 固定放置约束: 两道锁定竖墙夹出窄洞, 只排自由零件;
+   以及一个锁定旋转不合法的实际拒绝。
 """
 
 import time
 
 from nesting2d import (
     Board,
+    FixedPlacement,
     InvalidSpecError,
     Part,
     Status,
@@ -80,11 +83,42 @@ def demo_budget():
     assert full.status is Status.OPTIMAL
 
 
+def demo_fixed():
+    print("=" * 56)
+    print("算例 4: 固定放置约束(两道锁定竖墙夹出窄洞, 只排自由件)")
+    board = Board(5, 3)
+    vdom = lambda: Part([(0, 0), (0, 1)], rotations=(0,))
+    parts = [vdom(), vdom(), Part([(0, 0)])]
+    fixed = [FixedPlacement(0, 0, 0, 0), FixedPlacement(1, 4, 0, 0)]
+    print("  零件0: 竖直 2 格, 锁定于 (0,0)")
+    print("  零件1: 竖直 2 格, 锁定于 (4,0)")
+    print("  零件2: 单格, 自由排样(只能落进两墙一格膨胀后的窄洞)")
+    res = pack(board, parts, fixed=fixed)
+    print(f"状态: {res.status.value}  高度: {res.height}  "
+          f"可移动件旋转次数: {res.rotation_count}  下界: {res.lower_bound}")
+    print(f"布局坐标(零件0/1 保持锁定): {res.layout}")
+    problems = verify_layout(board, parts, res.placements, res.height, fixed=fixed)
+    print(f"约束+锁定校验: {'通过' if not problems else problems}")
+    print(render_layout(board, parts, res.placements, res.height))
+
+    print("-" * 56)
+    print("锁定旋转不合法 -> 搜索前直接拒绝(不会移开锁定件另给解):")
+    try:
+        pack(
+            Board(4, 4),
+            [Part([(0, 0), (1, 0)], rotations=(0,))],
+            fixed=[FixedPlacement(0, 0, 0, 90)],
+        )
+    except InvalidSpecError as e:
+        print(f"已拒绝 -> InvalidSpecError: {e}")
+
+
 def main():
     t0 = time.perf_counter()
     demo_normal()
     demo_rejection()
     demo_budget()
+    demo_fixed()
     print("=" * 56)
     print(f"演示总耗时: {time.perf_counter() - t0:.2f} s")
 
