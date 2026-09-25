@@ -12,6 +12,11 @@
 - 零件: 4-连通的格子集合, 每零件 ≤ **12** 格, 共 ≤ **12** 件。
 - 每个零件可独立指定允许的旋转角度(`0/90/180/270` 的非空子集, 默认仅 `0`)
   与是否允许镜像(默认允许); `pack(..., allow_reflection=False)` 全局禁用镜像。
+- **固定放置(锁定)**: `pack(..., locked=[LockedPlacement(...)])` 可指定一部分
+  零件的旋转角与锚点坐标, 优化器只安排剩余零件。锁定项在求解前整体验证
+  (方向合法且在允许旋转集内、镜像被允许、在板内、不覆盖禁放格、锁定项之间
+  互不重叠且满足一格边距); 任何违规 —— 包括固定项之间冲突 —— 直接抛
+  `InvalidSpecError` 拒绝, 求解器绝不移动锁定件去"找更好的解"。
 - **边距**: 任意两个不同零件的格子之间 Chebyshev 距离 ≥ 2
   (等价于每个零件按 Chebyshev 一格膨胀后互不相交)。
   **板外不计额外空间**: 零件可紧贴板材边缘; 膨胀掩码在板边界处裁剪。
@@ -20,10 +25,11 @@
 
 ### 优化目标(按优先级)
 
-1. 最小化使用高度 `h`;
+1. 最小化使用高度 `h`(**含锁定件的最高占用行**: `h` 不小于任何锁定件的
+   顶行 + 1);
 2. 最小化旋转次数 `rotation_count` = 放置方向旋转角 ≠ 0 的零件个数
-   (镜像不计入旋转次数);
-3. 最小化布局坐标字典序: 按零件下标比较每个零件的
+   (镜像不计入; **只统计本次可移动件**, 锁定件不计);
+3. 最小化**完整布局**(含锁定件)坐标字典序: 按零件下标比较每个零件的
    `(x, y, (rotation_degrees, mirrored))`。
 
 坐标系: `(x, y)`, `0 ≤ x < width`, `0 ≤ y < height`, y 向上。
@@ -32,7 +38,9 @@
 ## 接口
 
 ```python
-from nesting2d import Board, Part, pack, Status, verify_layout, render_layout
+from nesting2d import (
+    Board, Part, LockedPlacement, pack, Status, verify_layout, render_layout,
+)
 
 board = Board(5, 5, forbidden=[(4, 3)])
 parts = [
@@ -43,17 +51,26 @@ parts = [
 res = pack(board, parts, budget=1_000_000, allow_reflection=True)
 res.status          # Status.OPTIMAL / INFEASIBLE / BUDGET_EXHAUSTED
 res.height          # 最优(或最优已知)高度; 无可行解为 None
-res.placements      # tuple[Placement], 按零件下标排序
+res.placements      # tuple[Placement], 按零件下标排序(含锁定件)
 res.layout          # dict: part_index -> (x, y, rotation_degrees, mirrored)
-res.rotation_count  # 旋转次数
+res.rotation_count  # 旋转次数(只统计可移动件)
 res.lower_bound     # 已证明的下界(见下)
 res.nodes, res.budget
+
+# 固定放置: 锁定零件 1 在 (3,1) 不旋转, 优化器只安排其余零件
+res2 = pack(board, parts, locked=[LockedPlacement(1, 3, 1, 0)])
 ```
+
+`LockedPlacement(part_index, x, y, rotation_degrees, mirrored=False)`:
+锁定一个零件的放置。`rotation_degrees` 必须在该零件的 `rotations` 允许
+集合内(即使旋转后形状相同也不豁免); `mirrored=True` 要求零件与全局开关
+都允许镜像。所有件都锁定时直接返回 `OPTIMAL`(无需搜索, `nodes == 0`)。
 
 辅助函数:
 
-- `verify_layout(board, parts, placements, height) -> list[str]`:
-  独立校验布局, 返回问题列表(空 = 合法)。
+- `verify_layout(board, parts, placements, height, locked=()) -> list[str]`:
+  独立校验布局, 返回问题列表(空 = 合法); 给出 `locked` 时额外检查
+  被锁定零件的放置与锁定要求完全一致。
 - `render_layout(board, parts, placements, height) -> str`:
   字符画(顶行在上; 零件 `0-9A-Za-z`, 禁放格 `#`, 空白 `.`)。
 - `oriented_cells(cells, rotation_degrees, mirrored)`: 方向变换(与求解器同一代码路径)。
@@ -66,9 +83,11 @@ res.nodes, res.budget
 | `INFEASIBLE` | 已证明任何高度(≤ 板高)都不可行 | `None` | `board.height + 1` |
 | `BUDGET_EXHAUSTED` | 预算耗尽, **不假装最优** | 最优已知解(可能 `None`) | 已证明的下界 |
 
-下界 = max(1, ⌈总面积/板宽⌉, 各零件最小包围盒高度的最大值)。
-`budget` 以 DFS 节点数计, 所有高度的搜索共享同一预算; 耗尽时 `nodes`
-为实际访问计数(可能等于 `budget + 1`, 触发中止的节点也计入)。
+下界 = max(1, ⌈总面积/板宽⌉, 各自由零件最小包围盒高度的最大值, 锁定件最高
+占用行 + 1)。`budget` 以 DFS 节点数计, 所有高度的搜索共享同一预算; 耗尽时
+`nodes` 为实际访问计数(可能等于 `budget + 1`, 触发中止的节点也计入)。
+耗尽时若已有可行解, `height`/`placements` 是可行上界(真实合法布局),
+`lower_bound` 仍是有效下界。
 
 ## 错误语义
 
@@ -78,7 +97,8 @@ res.nodes, res.budget
   **NaN/Infinity**、非 bool 的开关参数、错误容器类型等;
 - `InvalidSpecError(ValueError)`: 取值域违规 —— 板尺寸超出 `[1, 20]`、
   零件为空/重复格/不连通/超过 12 格/超过 12 件、旋转角非 `0/90/180/270`、
-  空旋转集、禁放格越界或重复、`budget < 1` 等。
+  空旋转集、禁放格越界或重复、`budget < 1`、锁定放置越界/覆盖禁放格/
+  旋转不在允许集/镜像被禁/重复锁定/固定项之间冲突等。
 
 `Part`/`Board` 在构造时(`__post_init__)完成全部校验并归一化为不可变
 `frozenset`, 之后 `pack` 不会修改输入; 求解过程无可变全局状态,
@@ -92,7 +112,8 @@ python demo.py                            # 演示(约 1 s, 真实计算)
 ```
 
 `demo.py` 使用固定输入, 打印: 一个正常算例的字符布局与最优性状态、
-实际触发的输入拒绝(不连通零件/越界禁放格/bool 参数)、
+一个固定放置算例(锁定已切位置后重排剩余零件, 含固定项冲突与锁定旋转
+不合法的实际拒绝)、实际触发的输入拒绝(不连通零件/越界禁放格/bool 参数)、
 以及实际触发的预算耗尽(与最优/无解状态对比)。
 
 ## 设计取舍
@@ -100,9 +121,13 @@ python demo.py                            # 演示(约 1 s, 真实计算)
 - **位集回溯**: 每个候选放置预计算两个 Python int 位掩码(占用 + Chebyshev
   一格膨胀), 冲突检测为 O(1) 位运算; 膨胀在板边界裁剪(板外不计空间)。
 - **等形对称去重**: 同一零件由对称性产生的相同方向只保留代表元
-  (未镜像优先, 再按旋转角); 形状且允许方向完全相同的零件归为一组,
+  (未镜像优先, 再按旋转角); 形状且允许方向完全相同的**自由**零件归为一组,
   搜索时同组候选下标单调不减以破缺对称。注意: 形状相同但允许旋转集不同
-  的零件**不**同组(旋转次数目标不同, 不可互换)。
+  的零件**不**同组(旋转次数目标不同, 不可互换); **锁定件不参与分组** ——
+  固定身份不可与自由件交换, 否则对称破缺会把锁定要求抹掉。
+- **锁定件作为初始占用**: 锁定项验证后, 其占用/膨胀位掩码直接作为回溯
+  搜索的初始占用, 自由件候选照常生成; 高度下界额外计入锁定件最高占用,
+  可行性关于高度的单调性保持不变。
 - **两阶段驱动**: 利用可行性关于高度的单调性 —— 先在整板高度下贪心取
   任一可行解(首叶即停, 同时整板不可行 ⇔ 整体不可行), 再从下界向上逐高度
   完整枚举, 首次完整枚举成功的高度即最优高度, 该高度的枚举同时完成

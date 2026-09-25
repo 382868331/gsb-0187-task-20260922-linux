@@ -11,14 +11,21 @@
 * 板材上的禁放格(forbidden cells)不得被任何零件格子覆盖
   (边距膨胀只约束零件之间, 不约束零件与禁放格);
 * 每个零件可独立指定允许的旋转角度(0/90/180/270 度的子集)以及是否允许
-  镜像; 全局 ``allow_reflection`` 为 False 时所有零件禁用镜像。
+  镜像; 全局 ``allow_reflection`` 为 False 时所有零件禁用镜像;
+* 调用方可通过 ``locked`` 指定一部分零件的固定放置(旋转角 + 锚点坐标),
+  优化器只安排剩余零件。锁定项在求解前整体验证: 方向合法且在允许旋转
+  集合内、镜像被允许、在板内、不覆盖禁放格、锁定项之间互不重叠且满足
+  一格边距; 任何违规(含固定项之间冲突)直接抛出 ``InvalidSpecError``
+  拒绝, 求解器绝不移动锁定件去"找更好的解"。
 
 目标(按优先级):
 
-1. 最小化使用高度 ``h`` (1 <= h <= height, 只使用板材底部 h 行);
+1. 最小化使用高度 ``h`` (1 <= h <= height, 只使用板材底部 h 行;
+   锁定件的最高占用行同样计入, 即 h 不小于任何锁定件的顶行 + 1);
 2. 在最小高度下最小化旋转次数 ``rotation_count``
-   (放置方向旋转角 != 0 的零件个数; 镜像不算旋转);
-3. 再按布局坐标字典序最小化: 按零件下标顺序比较每个零件的
+   (放置方向旋转角 != 0 的零件个数; 镜像不算旋转;
+   **只统计本次可移动件**, 锁定件不计入);
+3. 再按完整布局(含锁定件)坐标字典序最小化: 按零件下标顺序比较每个零件的
    ``(x, y, orientation_code)``, 其中 orientation_code 为
    ``(rotation_degrees, mirrored)``。
 
@@ -28,9 +35,11 @@ y 向上增长; 使用底部 h 行即 ``0 <= y < h``。
 求解方法: 位集(bitset)回溯搜索。每个候选放置用两个 Python int 位掩码表示
 (实际占用掩码 + Chebyshev 一格膨胀掩码), 冲突检测为 O(1) 位运算。
 相同零件(形状与允许方向完全一致)在搜索中做对称破缺去重(同组零件的候选
-放置下标单调不减); 同一零件由对称性产生的相同方向也去重。搜索预算
-``budget`` 以 DFS 节点数计, 全程共享; 预算耗尽时报告当前最优已知解与
-已证明的下界, 绝不把未证明的结果标记为最优。
+放置下标单调不减); 同一零件由对称性产生的相同方向也去重。**锁定件不参与
+同形分组**: 固定身份不可与自由件交换, 否则锁定要求会被对称破缺抹掉。
+锁定件的占用/膨胀掩码作为搜索的初始占用, 自由件候选照常生成。
+搜索预算 ``budget`` 以 DFS 节点数计, 全程共享; 预算耗尽时报告当前最优
+已知解(可行上界)与已证明的下界(有效下界), 绝不把未证明的结果标记为最优。
 
 本模块只使用整数运算, 不产生任何浮点结果。
 """
@@ -53,6 +62,7 @@ __all__ = [
     "Part",
     "Board",
     "Placement",
+    "LockedPlacement",
     "PackResult",
     "pack",
     "verify_layout",
@@ -260,6 +270,27 @@ class Placement:
 
 
 @dataclass(frozen=True)
+class LockedPlacement:
+    """一个零件的固定放置要求(调用方指定, 求解器不得移动)。
+
+    ``part_index``: 被锁定零件在 ``parts`` 中的下标。
+    ``x, y``: 该零件所取方向归一化形状(最小坐标为 (0,0))的锚点。
+    ``rotation_degrees``: 指定旋转角 (0/90/180/270), 必须在该零件的
+    ``rotations`` 允许集合内。
+    ``mirrored``: 是否镜像; 为 True 时要求该零件及全局开关都允许镜像。
+
+    字段取值在 ``pack`` 求解前统一验证(结合板材与零件规格),
+    任何违规抛出 ``InvalidSpecError``/``TypeError``。
+    """
+
+    part_index: int
+    x: int
+    y: int
+    rotation_degrees: int
+    mirrored: bool = False
+
+
+@dataclass(frozen=True)
 class PackResult:
     """求解结果。"""
 
@@ -271,7 +302,7 @@ class PackResult:
     """对应的放置方案(按零件下标排序); 无可行解时为 None。"""
 
     rotation_count: Optional[int]
-    """该方案的旋转次数; 无可行解时为 None。"""
+    """该方案的旋转次数(只统计可移动件, 锁定件不计); 无可行解时为 None。"""
 
     lower_bound: int
     """已证明的下界: 任何可行解的使用高度 >= lower_bound。
@@ -461,6 +492,8 @@ class _Search:
         counter: List[int],
         budget: int,
         enumerate_all: bool,
+        locked_key: Optional[Dict[int, Tuple]] = None,
+        n_total: Optional[int] = None,
     ):
         self.variants = variants
         self.cands = cands
@@ -468,9 +501,12 @@ class _Search:
         self.counter = counter
         self.budget = budget
         self.enumerate_all = enumerate_all
-        n_parts = sum(len(g) for g in groups)
-        # 每个零件的放置 = 候选下标; -1 表示未放置
-        self.assign: List[int] = [-1] * n_parts
+        # 锁定件的字典序键条目(常量): part_index -> (x, y, (rot, mirrored))
+        self.locked_key = dict(locked_key) if locked_key else {}
+        self.n_free = sum(len(g) for g in groups)
+        self.n_total = n_total if n_total is not None else self.n_free
+        # 每个自由零件的放置 = 候选下标; -1 表示未放置(按下标直查, 含锁定槽位)
+        self.assign: List[int] = [-1] * self.n_total
         self.last_in_group: List[int] = [-1] * len(groups)
         self.best_key: Optional[Tuple] = None
         self.best_assign: Optional[Tuple[int, ...]] = None
@@ -480,7 +516,7 @@ class _Search:
         self.counter[0] += 1
         if self.counter[0] > self.budget:
             raise _BudgetExhausted
-        if placed == len(self.assign):
+        if placed == self.n_free:
             self._on_leaf(rot_cost)
             return
         if (
@@ -558,11 +594,12 @@ class _Search:
     def _layout_key(self) -> Tuple:
         """按零件下标顺序的 ((x, y, (rotation, mirrored)), ...) 元组。
 
-        同组(完全相同)零件可互换: 组内条目按字典序排序后填入递增的零件
-        下标槽位(对称破缺只保留一种组内排列, 规范化保证不丢最优);
-        最终键严格按零件下标顺序发射(同组成员的下标可能不连续)。
+        锁定件的条目是常量, 直接并入(完整布局顺序破平局); 同组(完全相同)
+        自由零件可互换: 组内条目按字典序排序后填入递增的零件下标槽位
+        (对称破缺只保留一种组内排列, 规范化保证不丢最优); 最终键严格按
+        零件下标顺序发射(同组成员的下标可能不连续)。
         """
-        entries_by_part: Dict[int, Tuple] = {}
+        entries_by_part: Dict[int, Tuple] = dict(self.locked_key)
         for g, members in enumerate(self.groups):
             entries = []
             for p in members:
@@ -572,7 +609,7 @@ class _Search:
             entries.sort()
             for p, entry in zip(members, entries):
                 entries_by_part[p] = entry
-        return tuple(entries_by_part[p] for p in range(len(self.assign)))
+        return tuple(entries_by_part[p] for p in range(self.n_total))
 
 
 # ---------------------------------------------------------------------------
@@ -617,11 +654,87 @@ def _forbidden_mask(board: Board, h: int) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _validate_locked(
+    board: Board,
+    parts: Sequence[Part],
+    locked: Sequence[LockedPlacement],
+    allow_reflection: bool,
+) -> Tuple[Dict[int, Tuple[int, int, int, bool]], int, int, int, List[Placement]]:
+    """求解前整体验证锁定放置; 任何违规直接拒绝(不移动锁定件)。
+
+    检查: 类型、零件下标(含重复锁定)、旋转角在允许集合内、镜像被允许、
+    板内、不覆盖禁放格、锁定项之间互不重叠且满足一格边距。
+    返回 (entries, mask, dil, top, placements):
+    entries: part_index -> (x, y, rot, mirrored); mask/dil: 锁定件的
+    占用/膨胀位掩码; top: 锁定件最高占用行 + 1(无锁定件时为 0)。
+    """
+    entries: Dict[int, Tuple[int, int, int, bool]] = {}
+    mask_u = 0
+    dil_u = 0
+    top = 0
+    placements: List[Placement] = []
+    for k, lk in enumerate(locked):
+        path = f"locked[{k}]"
+        if not isinstance(lk, LockedPlacement):
+            raise TypeError(
+                f"{path}: 需要 LockedPlacement, 得到 {type(lk).__name__}"
+            )
+        i = _require_int(lk.part_index, f"{path}.part_index")
+        if not (0 <= i < len(parts)):
+            raise InvalidSpecError(
+                f"{path}.part_index: {i} 超出零件下标范围 [0, {len(parts)})"
+            )
+        if i in entries:
+            raise InvalidSpecError(f"{path}.part_index: 零件 {i} 被重复锁定")
+        rot = _require_int(lk.rotation_degrees, f"{path}.rotation_degrees")
+        if rot not in _VALID_ROTATIONS:
+            raise InvalidSpecError(
+                f"{path}.rotation_degrees: 非法角度 {rot}, 只允许 0/90/180/270"
+            )
+        if not isinstance(lk.mirrored, bool):
+            raise TypeError(
+                f"{path}.mirrored: 需要 bool, 得到 {type(lk.mirrored).__name__}"
+            )
+        x = _require_int(lk.x, f"{path}.x")
+        y = _require_int(lk.y, f"{path}.y")
+        part = parts[i]
+        if rot not in part.rotations:
+            raise InvalidSpecError(
+                f"{path}: 零件 {i} 的允许旋转集不含 {rot} 度"
+            )
+        if lk.mirrored and not part.allow_reflection:
+            raise InvalidSpecError(f"{path}: 零件 {i} 禁用镜像, 锁定却要求镜像")
+        if lk.mirrored and not allow_reflection:
+            raise InvalidSpecError(f"{path}: 全局禁用镜像, 锁定却要求镜像")
+        shape = oriented_cells(part.cells, rot, lk.mirrored)
+        cells = [(cx + x, cy + y) for cx, cy in shape]
+        for cx, cy in cells:
+            if not (0 <= cx < board.width and 0 <= cy < board.height):
+                raise InvalidSpecError(
+                    f"{path}: 格子 ({cx}, {cy}) 超出板材范围"
+                )
+            if (cx, cy) in board.forbidden:
+                raise InvalidSpecError(f"{path}: 格子 ({cx}, {cy}) 覆盖禁放格")
+        m = _shape_mask(cells, board.width)
+        d = _dilate(m, board.width)
+        if m & dil_u or d & mask_u:
+            raise InvalidSpecError(
+                f"{path}: 与已锁定零件冲突(重叠或边距不足一格), 直接拒绝"
+            )
+        mask_u |= m
+        dil_u |= d
+        top = max(top, max(cy for _, cy in cells) + 1)
+        entries[i] = (x, y, rot, lk.mirrored)
+        placements.append(Placement(i, x, y, rot, lk.mirrored))
+    return entries, mask_u, dil_u, top, placements
+
+
 def pack(
     board: Board,
     parts: Sequence[Part],
     budget: int = DEFAULT_BUDGET,
     allow_reflection: bool = True,
+    locked: Sequence[LockedPlacement] = (),
 ) -> PackResult:
     """求解无重叠排样。
 
@@ -631,6 +744,9 @@ def pack(
     parts: Part 序列, 长度 1..MAX_PARTS。
     budget: 搜索预算(DFS 节点数, 正整数)。所有高度的搜索共享同一预算。
     allow_reflection: 全局镜像开关; False 时所有零件禁用镜像。
+    locked: LockedPlacement 序列(默认空)。被锁定零件的放置由调用方固定,
+        求解器只安排剩余零件; 锁定项先整体验证, 违规(含固定项之间冲突)
+        直接抛错拒绝, 绝不移动锁定件。
 
     返回 PackResult; 不会静默修正非法输入(类型错误抛 TypeError,
     取值域违规抛 InvalidSpecError)。
@@ -658,20 +774,58 @@ def pack(
             "allow_reflection: 需要 bool, 得到 "
             f"{type(allow_reflection).__name__}"
         )
+    if locked is None or isinstance(locked, (str, bytes)):
+        raise TypeError("locked: 需要 LockedPlacement 序列")
+    try:
+        locked = list(locked)
+    except TypeError:
+        raise TypeError("locked: 需要 LockedPlacement 序列") from None
+
+    # 锁定项先整体验证: 任何违规(含固定项之间冲突)在此直接抛错
+    (
+        locked_entries,
+        locked_mask,
+        locked_dil,
+        locked_top,
+        locked_placements,
+    ) = _validate_locked(board, parts, locked, allow_reflection)
+    n_total = len(parts)
+    free_indices = [i for i in range(n_total) if i not in locked_entries]
+    locked_key = {
+        i: (e[0], e[1], (e[2], e[3])) for i, e in locked_entries.items()
+    }
+
+    if not free_indices:
+        # 所有件都固定: 无需搜索, 高度 = 锁定件最高占用
+        placements = tuple(
+            sorted(locked_placements, key=lambda pl: pl.part_index)
+        )
+        return PackResult(
+            status=Status.OPTIMAL,
+            height=locked_top,
+            placements=placements,
+            rotation_count=0,
+            lower_bound=locked_top,
+            nodes=0,
+            budget=budget,
+        )
 
     counter = [0]
     w, H = board.width, board.height
-    total_area = sum(len(p.cells) for p in parts)
+    total_area = sum(len(p.cells) for p in parts)  # 含锁定件(面积下界仍有效)
 
-    # 每个零件的方向(等形去重后)
-    variants = [_variants_for(p, allow_reflection) for p in parts]
+    # 每个自由零件的方向(等形去重后)
+    variants = [_variants_for(parts[i], allow_reflection) for i in free_indices]
 
-    # 完全相同的零件(允许方向集合一致, 含代表旋转/镜像元数据)归为一组,
+    # 完全相同的自由零件(允许方向集合一致, 含代表旋转/镜像元数据)归为一组,
     # 做对称破缺。注意: 形状相同但允许旋转集不同的零件不可互换
-    # (旋转次数目标不同), 不能同组。
+    # (旋转次数目标不同), 不能同组; 锁定件不参与分组, 固定身份不可与
+    # 自由件交换。
     groups: List[List[int]] = []
     sig_to_group: Dict[Tuple, int] = {}
-    for i, v in enumerate(variants):
+    variants_of = dict(zip(free_indices, variants))
+    for i in free_indices:
+        v = variants_of[i]
         sig = tuple((vv.cells, vv.rotation, vv.mirrored) for vv in v)
         g = sig_to_group.get(sig)
         if g is None:
@@ -679,12 +833,12 @@ def pack(
             sig_to_group[sig] = g
             groups.append([])
         groups[g].append(i)
-    group_variants = [variants[members[0]] for members in groups]
+    group_variants = [variants_of[members[0]] for members in groups]
 
-    # 下界: 面积下界与"每零件最小包围盒高度"下界的较大者
+    # 下界: 面积下界、"每自由零件最小包围盒高度"下界与锁定件最高占用的较大者
     lb_area = -(-total_area // w)  # ceil
     lb_part = max(min(v.h for v in vs) for vs in variants)
-    lb = max(1, lb_area, lb_part)
+    lb = max(1, lb_area, lb_part, locked_top)
 
     def finish(status, height, placements, rot, lower) -> PackResult:
         return PackResult(
@@ -698,9 +852,10 @@ def pack(
         )
 
     def make_placements(cands_per_group, assignment) -> Tuple[Placement, ...]:
-        # 同组零件可互换: 组内放置按 (x, y, (rot, mirrored)) 排序后填入
-        # 递增的零件下标, 使报告的布局为字典序最小排列(与 _layout_key 一致)
-        out = []
+        # 同组自由零件可互换: 组内放置按 (x, y, (rot, mirrored)) 排序后填入
+        # 递增的零件下标, 使报告的布局为字典序最小排列(与 _layout_key 一致);
+        # 锁定件保持固定身份, 直接并入结果
+        out = list(locked_placements)
         for g, members in enumerate(groups):
             entries = []
             for p in members:
@@ -714,10 +869,15 @@ def pack(
         return tuple(out)
 
     def rot_of(placements: Tuple[Placement, ...]) -> int:
-        return sum(1 for pl in placements if pl.rotation_degrees != 0)
+        # 只统计可移动件: 锁定件的旋转不计入第二目标
+        return sum(
+            1
+            for pl in placements
+            if pl.rotation_degrees != 0 and pl.part_index not in locked_entries
+        )
 
     def used_height(cands_per_group, assignment) -> int:
-        uh = 1
+        uh = max(1, locked_top)  # 高度目标包含锁定件最高占用
         for g, members in enumerate(groups):
             for p in members:
                 cand = cands_per_group[g][assignment[p]]
@@ -736,11 +896,12 @@ def pack(
             # 某零件在整板高度下都无合法放置: 整体不可行
             return finish(Status.INFEASIBLE, None, None, None, H + 1)
         s = _Search(
-            group_variants, cands_g, groups, counter, budget, enumerate_all=False
+            group_variants, cands_g, groups, counter, budget,
+            enumerate_all=False, locked_key=locked_key, n_total=n_total,
         )
         incumbent_assignment: Optional[Tuple[int, ...]] = None
         try:
-            s.dfs(0, 0, 0, 0)
+            s.dfs(0, locked_mask, locked_dil, 0)
         except _GreedyDone as gd:
             incumbent_assignment = gd.assignment
         if incumbent_assignment is None:
@@ -768,9 +929,9 @@ def pack(
                 continue  # 某零件在此高度无任何合法放置: 不可行
             s = _Search(
                 group_variants, cands_h, groups, counter, budget,
-                enumerate_all=True,
+                enumerate_all=True, locked_key=locked_key, n_total=n_total,
             )
-            s.dfs(0, 0, 0, 0)
+            s.dfs(0, locked_mask, locked_dil, 0)
             if s.best_assign is not None:
                 best_h = h
                 best_pl = make_placements(cands_h, s.best_assign)
@@ -785,9 +946,9 @@ def pack(
             ]
             s = _Search(
                 group_variants, cands_h, groups, counter, budget,
-                enumerate_all=True,
+                enumerate_all=True, locked_key=locked_key, n_total=n_total,
             )
-            s.dfs(0, 0, 0, 0)
+            s.dfs(0, locked_mask, locked_dil, 0)
             if s.best_assign is not None:
                 best_pl = make_placements(cands_h, s.best_assign)
     except _BudgetExhausted:
@@ -807,11 +968,13 @@ def verify_layout(
     parts: Sequence[Part],
     placements: Sequence[Placement],
     height: int,
+    locked: Sequence[LockedPlacement] = (),
 ) -> List[str]:
     """校验一个布局是否满足全部约束; 返回问题描述列表(空列表 = 合法)。
 
     检查: 零件数匹配、方向被允许、板内、禁放格、互不重叠、
     零件间 Chebyshev 一格边距、使用高度 <= height。
+    若给出 ``locked``, 额外检查被锁定零件的放置与锁定要求完全一致。
     """
     problems: List[str] = []
     height = _require_int(height, "height")
@@ -877,6 +1040,30 @@ def verify_layout(
         for j in range(i + 1, len(masks)):
             if masks[i] & dils[j] or masks[j] & dils[i]:
                 problems.append(f"零件 {i} 与零件 {j} 之间边距不足一格")
+    if locked is None:
+        locked = ()
+    by_index = {}
+    for pl in placements:
+        if isinstance(pl.part_index, int) and pl.part_index not in by_index:
+            by_index[pl.part_index] = pl
+    for k, lk in enumerate(locked):
+        path = f"locked[{k}]"
+        if not isinstance(lk, LockedPlacement):
+            problems.append(
+                f"{path}: 需要 LockedPlacement, 得到 {type(lk).__name__}"
+            )
+            continue
+        pl = by_index.get(lk.part_index)
+        if pl is None:
+            problems.append(f"{path}: 零件 {lk.part_index} 没有对应放置")
+            continue
+        got = (pl.x, pl.y, pl.rotation_degrees, pl.mirrored)
+        want = (lk.x, lk.y, lk.rotation_degrees, lk.mirrored)
+        if got != want:
+            problems.append(
+                f"{path}: 零件 {lk.part_index} 的放置 {got} "
+                f"与锁定要求 {want} 不一致"
+            )
     return problems
 
 
