@@ -1,10 +1,23 @@
-# nesting2d — 约束二维材料片的无重叠排样
+# nesting2d — 约束二维材料片的无重叠排样 + 整刀切割检查
 
 离线制造几何工程用可复用模块: 在整数网格板材上无重叠排样连通格子零件,
-求最小使用高度。**纯 Python 标准库实现, 从零编写, 不依赖任何第三方包。**
+求最小使用高度; 并对给定布局做**整刀(guillotine)可加工性检查**与最优
+切割树生成。**纯 Python 标准库实现, 从零编写, 不依赖任何第三方包。**
 
 - Python 版本: **3.14.7**(仅标准库; 安装 Python 后无需安装任何其他依赖)
 - 平台: Linux 原生; 核心、测试、演示全部离线, 不需要网络/账号/数据库/Docker
+
+## 环境准备(venv)
+
+```bash
+python3.14 -m venv .venv          # 任意 3.14.7 解释器均可
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python demo.py           # 排样演示
+.venv/bin/python demo_iteration.py # 整刀切割演示
+```
+
+无第三方依赖, `pip install` 什么也不需要装; 也可以直接用系统
+`python3.14` 代替 `.venv/bin/python`。
 
 ## 问题定义
 
@@ -58,6 +71,45 @@ res.nodes, res.budget
   字符画(顶行在上; 零件 `0-9A-Za-z`, 禁放格 `#`, 空白 `.`)。
 - `oriented_cells(cells, rotation_degrees, mirrored)`: 方向变换(与求解器同一代码路径)。
 
+## 整刀(guillotine)切割检查
+
+给定一个**已经排好的**布局(位置固定, 不重新优化排样), 判断能否只用
+整刀把各零件从板材上切出来, 并生成最优切割树:
+
+- 每一刀必须**贯穿当前子板**(从一条边切到对边), 切线只落在整数网格线上;
+- 切线**不得穿过任何零件内部**(零件横跨切线 = 该零件在切线两侧有相邻格),
+  但**可以沿零件边界走**(不同零件分居切线两侧不构成阻挡);
+- 叶节点要么恰好包含**一件完整零件**, 要么是**废料**;
+  **零宽废料不单独成片**(切线坐标严格在子板内部, 两个子板都非退化);
+- 目标按优先级: **最少刀数 → 最短总切长 → 切割树坐标字典序**
+  (切向 v<h, 再按切线坐标与子树递归比较)。
+
+```python
+from nesting2d import guillotine_cut, GuillotineStatus
+
+res = guillotine_cut(board, parts, placements, budget=1_000_000)
+res.status        # CUTTABLE / NOT_GUILLOTINEABLE / BUDGET_EXHAUSTED
+res.cuts          # tuple[Cut]: 先序全部刀, 每刀带 axis/coord/rect(子板范围)/length
+res.tree          # 切割树: CutBranch(cut, lower, upper) / CutLeaf(rect, part_index|None)
+res.total_length  # 总切长(整数)
+res.blocking      # 不可切时根子板全部候选切线的阻挡见证 tuple[BlockedCut]
+res.nodes, res.budget
+```
+
+状态语义(预算耗尽与确定不可切严格分开):
+
+| 状态 | 含义 | cuts/tree | blocking |
+|---|---|---|---|
+| `CUTTABLE` | 找到最优整刀方案(三级目标均已优化) | 最优方案 | `None` |
+| `NOT_GUILLOTINEABLE` | **已证明**根子板无任何合法第一刀 | `None` | 每条候选切线的阻挡零件 |
+| `BUDGET_EXHAUSTED` | 预算耗尽, **不下结论** | `None` | `None` |
+
+布局合法性: 每个零件恰好放置一次、方向被允许、格子在板内、不覆盖
+禁放格、互不重叠; 违反即抛 `InvalidSpecError`。注意这里**不**强制
+零件间 Chebyshev 边距 —— 边距是排样阶段约束, 与切割无关; 紧贴的
+无重叠布局照样可以做整刀检查。预算以**递归处理的不同子板矩形数**计
+(记忆化去重后计一次)。
+
 ### 结果状态语义(预算耗尽与证明无解严格区分)
 
 | 状态 | 含义 | height/placements | lower_bound |
@@ -95,6 +147,10 @@ python demo.py                            # 演示(约 1 s, 真实计算)
 实际触发的输入拒绝(不连通零件/越界禁放格/bool 参数)、
 以及实际触发的预算耗尽(与最优/无解状态对比)。
 
+`demo_iteration.py` 演示本次新增的整刀检查(约 0.1 s, 真实计算):
+一个可整刀布局的逐刀子板范围与切割树、一个 4x4 风车形(5 件铺满)
+无第一刀布局的逐切线阻挡见证、以及预算耗尽与确定不可切的对比。
+
 ## 设计取舍
 
 - **位集回溯**: 每个候选放置预计算两个 Python int 位掩码(占用 + Chebyshev
@@ -122,3 +178,8 @@ python demo.py                            # 演示(约 1 s, 真实计算)
   因此没有数值误差; 任何浮点输入(包括 NaN/Infinity)直接被拒绝。
 - 测试中的独立参考实现(`tests/_reference.py`)为逐格穷举, 只适用于
   小规模交叉验证, 不是性能参照。
+- 整刀检查只处理**网格线上的轴对齐整刀**(这是本题契约的切割模型),
+  不支持斜切、非贯穿刀、或先叠合再切; 判定的是给定固定布局,
+  不通过重新排样来"挽救"不可切的布局。
+- 整刀检查的独立参考(`tests/_guillotine_ref.py`)为朴素递归枚举,
+  同样只用于小规模交叉验证。

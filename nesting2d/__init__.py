@@ -40,7 +40,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 __all__ = [
     "MAX_BOARD_WIDTH",
@@ -58,6 +58,14 @@ __all__ = [
     "verify_layout",
     "render_layout",
     "oriented_cells",
+    "GuillotineStatus",
+    "Cut",
+    "CutLeaf",
+    "CutBranch",
+    "CutTree",
+    "BlockedCut",
+    "GuillotineResult",
+    "guillotine_cut",
 ]
 
 # ---------------------------------------------------------------------------
@@ -908,3 +916,347 @@ def render_layout(
             if 0 <= gx < board.width and 0 <= gy < height:
                 grid[gy][gx] = ch
     return "\n".join("".join(row) for row in reversed(grid))
+
+
+# ---------------------------------------------------------------------------
+# 整刀(guillotine)切割检查与切割树生成
+# ---------------------------------------------------------------------------
+#
+# 给定一个固定布局(不重新排样), 判断能否只用整刀加工:
+# 每一刀必须贯穿当前子板(从一条边切到对边), 不能穿过任何零件内部;
+# 切线可沿零件边界走。叶节点要么恰好包含一件完整零件, 要么是废料。
+# 零宽废料不单独成片(切线坐标严格落在子板内部, 两个子板都是非空矩形)。
+#
+# 几何口径: 所有零件是轴对齐单位格子的并集, 切线只允许落在整数网格线上
+# (竖线 x=k, 横线 y=k)。竖切线 x=k 在子板纵向区间 y∈[y0,y1) 内被某
+# 零件挡住, 当且仅当该零件同时占据 (k-1, cy) 与 (k, cy) 两格(共享边
+# 成为零件内部); 仅被不同零件分居两侧、或沿零件边界行走时不构成阻挡。
+#
+# 目标(按优先级):
+#   1. 最少刀数;
+#   2. 最少总切长(每刀长度 = 当前子板在垂直方向上的边长);
+#   3. 切割树坐标字典序(切向 v<h, 再按切线坐标与两个子树递归比较)。
+# 用对子板矩形的记忆化递归枚举全部合法第一刀; 预算(以递归处理的
+# 不同子板矩形数计)耗尽时报告 BUDGET_EXHAUSTED, 绝不与"已证明不可
+# 整刀加工"(NOT_GUILLOTINEABLE)混为一谈。
+
+
+class GuillotineStatus(Enum):
+    """整刀检查状态。预算耗尽与已证明不可切严格区分。"""
+
+    CUTTABLE = "cuttable"
+    """已找到最优整刀方案(最少刀数、最短总切长、字典序)。"""
+
+    NOT_GUILLOTINEABLE = "not_guillotineable"
+    """已证明不可整刀加工: 根子板的每条候选第一刀都被零件挡住。"""
+
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    """搜索预算耗尽: 未能下结论, 不假装可切也不假装不可切。"""
+
+
+@dataclass(frozen=True)
+class Cut:
+    """一刀: 在子板 rect 内沿 axis 方向于 coord 处贯穿切割。
+
+    axis="v": 竖切线 x=coord(从上边切到下边);
+    axis="h": 横切线 y=coord(从左边切到右边)。
+    rect=(x0, y0, x1, y1): 半开区间, 本刀作用的子板范围,
+    满足 x0 < coord < x1 (或 y0 < coord < y1)。
+    """
+
+    axis: str
+    coord: int
+    rect: Tuple[int, int, int, int]
+
+    @property
+    def length(self) -> int:
+        """本刀长度: 子板在垂直于切线方向上的边长。"""
+        x0, y0, x1, y1 = self.rect
+        return y1 - y0 if self.axis == "v" else x1 - x0
+
+
+@dataclass(frozen=True)
+class CutLeaf:
+    """切割树叶节点: 一个子板矩形。
+
+    part_index 为 None 时是废料叶; 否则该矩形恰好包含这一件完整
+    零件(矩形内可能含贴边废料, 不再单独成片)。
+    """
+
+    rect: Tuple[int, int, int, int]
+    part_index: Optional[int]
+
+
+@dataclass(frozen=True)
+class CutBranch:
+    """切割树内部节点: 一刀及其两个子板。
+
+    lower 为坐标较小一侧的子板(竖切的左侧/横切的下侧),
+    upper 为坐标较大一侧(右侧/上侧)。
+    """
+
+    cut: Cut
+    lower: "CutTree"
+    upper: "CutTree"
+
+
+CutTree = Union[CutLeaf, CutBranch]
+
+
+@dataclass(frozen=True)
+class BlockedCut:
+    """阻挡见证: 根子板上一条候选切线被哪些零件挡住。"""
+
+    axis: str
+    coord: int
+    parts: Tuple[int, ...]
+    """挡住该切线的零件下标(这些零件都有格子横跨该切线)。"""
+
+
+@dataclass(frozen=True)
+class GuillotineResult:
+    """整刀检查结果。"""
+
+    status: GuillotineStatus
+    cuts: Optional[Tuple[Cut, ...]]
+    """最优方案的全部刀(先序: 根刀在前), 每刀携带其子板范围;
+    不可切/预算耗尽时为 None。"""
+
+    tree: Optional[CutTree]
+    """对应的切割树(CutLeaf/CutBranch); 失败时为 None。"""
+
+    total_length: Optional[int]
+    """总切长(整数); 失败时为 None。"""
+
+    nodes: int
+    """实际处理的不同子板矩形数(记忆化后计一次)。"""
+
+    budget: int
+    """本次检查的预算上限(子板矩形数)。"""
+
+    blocking: Optional[Tuple[BlockedCut, ...]]
+    """NOT_GUILLOTINEABLE 时根子板全部候选切线的阻挡见证;
+    CUTTABLE/BUDGET_EXHAUSTED 时为 None。"""
+
+
+def guillotine_cut(
+    board: Board,
+    parts: Sequence[Part],
+    placements: Sequence[Placement],
+    budget: int = DEFAULT_BUDGET,
+) -> GuillotineResult:
+    """对给定布局做整刀检查并生成最优切割树。
+
+    位置固定, 不重新优化排样。布局必须合法: 每个零件恰好放置一次、
+    方向被允许、全部格子在板内、不覆盖禁放格、互不重叠。注意这里
+    **不**强制零件间 Chebyshev 边距 —— 边距是排样阶段的约束, 与
+    切割无关; 任何重叠/越界/非法方向仍直接抛 InvalidSpecError,
+    不会静默"原谅"后宣布可切。
+
+    参数
+    ----
+    board: Board 实例。
+    parts: Part 序列, 长度 1..MAX_PARTS。
+    placements: Placement 序列(每个零件恰好一次)。
+    budget: 递归处理子板矩形数的预算(正整数, 记忆化去重后计)。
+
+    返回 GuillotineResult:
+      CUTTABLE           -> cuts/tree/total_length 为最优方案;
+      NOT_GUILLOTINEABLE -> blocking 给出根子板的阻挡见证;
+      BUDGET_EXHAUSTED   -> 不下结论(与不可切严格分开)。
+    """
+    if not isinstance(board, Board):
+        raise TypeError(f"board: 需要 Board, 得到 {type(board).__name__}")
+    if isinstance(parts, (str, bytes)):
+        raise TypeError("parts: 需要 Part 序列")
+    try:
+        parts = list(parts)
+    except TypeError:
+        raise TypeError("parts: 需要 Part 序列") from None
+    for i, p in enumerate(parts):
+        if not isinstance(p, Part):
+            raise TypeError(f"parts[{i}]: 需要 Part, 得到 {type(p).__name__}")
+    if not (1 <= len(parts) <= MAX_PARTS):
+        raise InvalidSpecError(
+            f"parts: 零件数 {len(parts)} 超出范围 [1, {MAX_PARTS}]"
+        )
+    if isinstance(placements, (str, bytes)):
+        raise TypeError("placements: 需要 Placement 序列")
+    try:
+        placements = list(placements)
+    except TypeError:
+        raise TypeError("placements: 需要 Placement 序列") from None
+    for i, pl in enumerate(placements):
+        if not isinstance(pl, Placement):
+            raise TypeError(
+                f"placements[{i}]: 需要 Placement, 得到 {type(pl).__name__}"
+            )
+    budget = _require_int(budget, "budget")
+    if budget < 1:
+        raise InvalidSpecError(f"budget: 需要 >= 1, 得到 {budget}")
+
+    n = len(parts)
+    if len(placements) != n:
+        raise InvalidSpecError(
+            f"placements: 数量 {len(placements)} 与零件数 {n} 不一致"
+        )
+    # 每件零件的绝对格子(按下标排列)
+    abs_cells: List[Tuple[Tuple[int, int], ...]] = [()] * n
+    seen_idx = set()
+    for pl in placements:
+        i = pl.part_index
+        if not isinstance(i, int) or isinstance(i, bool) or not (0 <= i < n):
+            raise InvalidSpecError(f"placements: 非法零件下标 {i!r}")
+        if i in seen_idx:
+            raise InvalidSpecError(f"placements: 零件 {i} 被重复放置")
+        seen_idx.add(i)
+        part = parts[i]
+        rot = _require_int(pl.rotation_degrees, f"placements[{i}].rotation_degrees")
+        if rot not in part.rotations:
+            raise InvalidSpecError(
+                f"placements[{i}]: 旋转角 {rot} 不在该零件允许集合内"
+            )
+        if not isinstance(pl.mirrored, bool):
+            raise TypeError(
+                f"placements[{i}].mirrored: 需要 bool, 得到 "
+                f"{type(pl.mirrored).__name__}"
+            )
+        if pl.mirrored and not part.allow_reflection:
+            raise InvalidSpecError(
+                f"placements[{i}]: 使用了镜像但该零件禁用镜像"
+            )
+        px = _require_int(pl.x, f"placements[{i}].x")
+        py = _require_int(pl.y, f"placements[{i}].y")
+        shape = oriented_cells(
+            part.cells, rot, pl.mirrored
+        )
+        cells = tuple(sorted((x + px, y + py) for x, y in shape))
+        for x, y in cells:
+            if not (0 <= x < board.width and 0 <= y < board.height):
+                raise InvalidSpecError(
+                    f"placements[{i}]: 格子 ({x}, {y}) 超出板材范围"
+                )
+            if (x, y) in board.forbidden:
+                raise InvalidSpecError(
+                    f"placements[{i}]: 格子 ({x}, {y}) 覆盖禁放格"
+                )
+        abs_cells[i] = cells
+    owner: Dict[Tuple[int, int], int] = {}
+    for p, cells in enumerate(abs_cells):
+        for c in cells:
+            if c in owner:
+                raise InvalidSpecError(
+                    f"placements: 零件 {p} 与零件 {owner[c]} 在格子 {c} 重叠"
+                )
+            owner[c] = p
+
+    # 阻挡对(切线坐标, 沿线位置): 竖切线 x=k 记 (k, cy); 横切线 y=k 记 (k, cx)
+    vblock: List[set] = [set() for _ in range(n)]
+    hblock: List[set] = [set() for _ in range(n)]
+    for p, cells in enumerate(abs_cells):
+        cs = set(cells)
+        for x, y in cells:
+            if (x + 1, y) in cs:
+                vblock[p].add((x + 1, y))
+            if (x, y + 1) in cs:
+                hblock[p].add((y + 1, x))
+
+    root_rect = (0, 0, board.width, board.height)
+
+    def parts_in(rect) -> List[int]:
+        x0, y0, x1, y1 = rect
+        out = []
+        for p, cells in enumerate(abs_cells):
+            if any(x0 <= x < x1 and y0 <= y < y1 for x, y in cells):
+                out.append(p)
+        return out
+
+    def blockers(axis, coord, span_lo, span_hi) -> List[int]:
+        """在垂直于切线的区间 [span_lo, span_hi) 内横跨切线的零件。"""
+        table = vblock if axis == "v" else hblock
+        out = []
+        for p in range(n):
+            for c, t in table[p]:
+                if c == coord and span_lo <= t < span_hi:
+                    out.append(p)
+                    break
+        return out
+
+    counter = [0]
+    memo: Dict[Tuple, Optional[tuple]] = {}
+
+    # 解 = (刀数, 总切长, 字典序键, 先序切刀元组, 切割树)
+    def solve(rect):
+        if rect in memo:
+            return memo[rect]
+        counter[0] += 1
+        if counter[0] > budget:
+            raise _BudgetExhausted
+        x0, y0, x1, y1 = rect
+        present = parts_in(rect)
+        if len(present) <= 1:
+            leaf = CutLeaf(rect, present[0] if present else None)
+            key = (0, present[0] if present else -1)
+            memo[rect] = (0, 0, key, (), leaf)
+            return memo[rect]
+        best = None
+        for axis in ("v", "h"):
+            if axis == "v":
+                lo, hi, span_lo, span_hi = x0, x1, y0, y1
+            else:
+                lo, hi, span_lo, span_hi = y0, y1, x0, x1
+            for k in range(lo + 1, hi):
+                if blockers(axis, k, span_lo, span_hi):
+                    continue  # 有零件横跨: 该切线穿过零件内部
+                if axis == "v":
+                    rect_low = (x0, y0, k, y1)
+                    rect_up = (k, y0, x1, y1)
+                else:
+                    rect_low = (x0, y0, x1, k)
+                    rect_up = (x0, k, x1, y1)
+                s_low = solve(rect_low)
+                s_up = solve(rect_up)
+                if s_low is None or s_up is None:
+                    continue  # 某个子板不可整刀: 这一刀不成立
+                cut = Cut(axis, k, rect)
+                cuts_count = 1 + s_low[0] + s_up[0]
+                length = y1 - y0 if axis == "v" else x1 - x0
+                total = length + s_low[1] + s_up[1]
+                key = (1, 0 if axis == "v" else 1, k, s_low[2], s_up[2])
+                cuts_tuple = (cut,) + s_low[3] + s_up[3]
+                tree = CutBranch(cut, s_low[4], s_up[4])
+                cand = (cuts_count, total, key, cuts_tuple, tree)
+                if best is None or cand[:3] < best[:3]:
+                    best = cand
+        memo[rect] = best
+        return best
+
+    try:
+        sol = solve(root_rect)
+    except _BudgetExhausted:
+        return GuillotineResult(
+            GuillotineStatus.BUDGET_EXHAUSTED, None, None, None,
+            counter[0], budget, None,
+        )
+
+    if sol is None:
+        x0, y0, x1, y1 = root_rect
+        witness = []
+        for axis in ("v", "h"):
+            if axis == "v":
+                lo, hi, span_lo, span_hi = x0, x1, y0, y1
+            else:
+                lo, hi, span_lo, span_hi = y0, y1, x0, x1
+            for k in range(lo + 1, hi):
+                witness.append(
+                    BlockedCut(axis, k, tuple(blockers(axis, k, span_lo, span_hi)))
+                )
+        return GuillotineResult(
+            GuillotineStatus.NOT_GUILLOTINEABLE, None, None, None,
+            counter[0], budget, tuple(witness),
+        )
+
+    return GuillotineResult(
+        GuillotineStatus.CUTTABLE, sol[3], sol[4], sol[1],
+        counter[0], budget, None,
+    )
