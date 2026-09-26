@@ -127,3 +127,47 @@ def solve(board, parts, allow_reflection: bool = True):
         if best_layout_at_h[0] is not None:
             return (h, best_key_at_h[0][0], best_key_at_h[0][1], best_layout_at_h[0])
     return None
+
+
+def guillotine_min_cuts(bboxes, width, height):
+    """独立的整刀可切性参考: 纯递归枚举全部可用切线, 不用记忆化。
+
+    bboxes: 每零件的绝对包围盒 (x0, y0, x1, y1)(半开区间)。
+    返回 (最少刀数, 最短总切长); 不可切返回 None。
+    只适用于小规模交叉验证(指数级, 无缓存)。
+    """
+
+    def solve(rect):
+        x0, y0, x1, y1 = rect
+        inside = [
+            b for b in bboxes
+            if x0 <= b[0] and b[1] >= y0 and b[2] <= x1 and b[3] <= y1
+        ]
+        if len(inside) <= 1:
+            return (0, 0)
+        best = None
+        for c in range(x0 + 1, x1):
+            if any(b[0] < c < b[2] for b in inside):
+                continue
+            left = solve((x0, y0, c, y1))
+            right = solve((c, y0, x1, y1))
+            if left is None or right is None:
+                continue
+            cand = (1 + left[0] + right[0],
+                    (y1 - y0) + left[1] + right[1])
+            if best is None or cand < best:
+                best = cand
+        for c in range(y0 + 1, y1):
+            if any(b[1] < c < b[3] for b in inside):
+                continue
+            bottom = solve((x0, y0, x1, c))
+            top = solve((x0, c, x1, y1))
+            if bottom is None or top is None:
+                continue
+            cand = (1 + bottom[0] + top[0],
+                    (x1 - x0) + bottom[1] + top[1])
+            if best is None or cand < best:
+                best = cand
+        return best
+
+    return solve((0, 0, width, height))

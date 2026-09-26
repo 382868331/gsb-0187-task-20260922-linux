@@ -58,6 +58,50 @@ res.nodes, res.budget
   字符画(顶行在上; 零件 `0-9A-Za-z`, 禁放格 `#`, 空白 `.`)。
 - `oriented_cells(cells, rotation_degrees, mirrored)`: 方向变换(与求解器同一代码路径)。
 
+## 整刀(guillotine)可切性检查与切割树生成
+
+在**位置固定**的既有布局上判断能否用整刀加工, 并生成最优切割树;
+不会重新优化排样。每刀沿格线贯穿当前子板(从一条边到对边),
+可贴零件边界走刀, 但不得把任何零件分到线的两侧(格子不可再分,
+穿过零件内部即把该零件分到两侧)。刀位严格在子板内部, 两个子板
+至少 1 格宽/高, **零宽废料不单独成片**。叶节点要么恰好含一件完整
+零件(零件叶), 要么不含任何零件(废料叶)。
+
+```python
+from nesting2d import guillotine_cuts, GuillotineStatus
+
+gres = guillotine_cuts(board, parts, placements, height=None, budget=1_000_000)
+gres.status            # CUTTABLE / NOT_CUTTABLE / BUDGET_EXHAUSTED
+gres.cut_count         # 最少刀数
+gres.total_cut_length  # 最短总切长(格)
+gres.cuts              # 最优切割序列(先序), 每刀 Cut(axis, position, rect)
+gres.tree              # 切割树 CutNode(内部节点两个孩子; 竖刀先左后右, 横刀先下后上)
+gres.nodes, gres.budget
+```
+
+- `height=None` 时取布局实际使用高度; 只切底部 `height` 行。
+- 布局先经 `verify_layout` 校验, 存在问题抛 `InvalidSpecError`,
+  不静默继续; 类型/取值域错误语义与 `pack` 一致。
+- `Cut.rect` / `CutNode.rect` 为该刀(节点)作用的子板
+  `(x0, y0, x1, y1)` 半开区间(单位: 格); `Cut.length` 为切长
+  (竖刀 = 子板高度, 横刀 = 子板宽度)。
+
+### 优化目标(按优先级)
+
+1. 最少刀数; 2. 最短总切长; 3. 按坐标顺序选 —— 比较切割序列(先序)
+每刀的 `(axis, position, rect)`, 字典序最小者胜出。
+
+### 结果状态语义(预算耗尽与确定不可切严格区分)
+
+| 状态 | 含义 |
+|---|---|
+| `CUTTABLE` | 已证明可整刀加工, 给出最优切割树 |
+| `NOT_CUTTABLE` | 已证明不存在任何整刀切割序列(如风车形布局无第一刀) |
+| `BUDGET_EXHAUSTED` | 预算耗尽, 既未证明可切也未证明不可切 |
+
+搜索以子板矩形为状态做记忆化动态规划(刀从不切分零件, 零件集合由
+矩形唯一确定); `budget` 以实际展开的状态数计。
+
 ### 结果状态语义(预算耗尽与证明无解严格区分)
 
 | 状态 | 含义 | height/placements | lower_bound |
@@ -87,13 +131,24 @@ res.nodes, res.budget
 ## 运行
 
 ```bash
+# 可选: 准备隔离环境(非必需 —— 仅标准库, 系统 Python 即可运行)
+python3 -m venv .venv && . .venv/bin/activate
+
 python -m unittest discover -s tests -v   # 必要测试(约 0.1 s)
 python demo.py                            # 演示(约 1 s, 真实计算)
+python demo_iteration.py                  # 本次迭代演示: 整刀检查/切割树(约 0.1 s)
 ```
+
+无需安装任何第三方依赖(`requirements.txt` 仅为版本说明)。
 
 `demo.py` 使用固定输入, 打印: 一个正常算例的字符布局与最优性状态、
 实际触发的输入拒绝(不连通零件/越界禁放格/bool 参数)、
 以及实际触发的预算耗尽(与最优/无解状态对比)。
+
+`demo_iteration.py` 演示本次新增功能: 一个可整刀加工的布局
+(pack 排样 + 最优切割树, 打印每刀作用的子板范围)、一个风车形
+不可切布局(逐条候选第一刀给出阻挡零件作为见证)、以及整刀搜索的
+预算耗尽(与确定不可切对比)。
 
 ## 设计取舍
 
@@ -122,3 +177,5 @@ python demo.py                            # 演示(约 1 s, 真实计算)
   因此没有数值误差; 任何浮点输入(包括 NaN/Infinity)直接被拒绝。
 - 测试中的独立参考实现(`tests/_reference.py`)为逐格穷举, 只适用于
   小规模交叉验证, 不是性能参照。
+- 整刀检查假定刀沿格线走、零件不可再分(格子为最小单位); 只判断
+  固定布局的可切性, 不通过重排零件把不可切布局变成可切。
