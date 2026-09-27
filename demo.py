@@ -80,11 +80,38 @@ def demo_budget():
     assert full.status is Status.OPTIMAL
 
 
+def demo_damage_wall():
+    print("=" * 56)
+    print("算例 4: 损坏柱把板材隔成多块(损坏区连边界)")
+    # 损坏柱 x=2 贯穿 5 行, 把 5x5 板切成两个宽 2 的连通块;
+    # 两个多米诺只能各占一块, 高度 1 横放即可。
+    wall = [(2, y) for y in range(5)]
+    board = Board(5, 5, forbidden=wall)
+    domino = Part([(0, 0), (1, 0)], rotations=(0, 90))
+    res = pack(board, [domino, domino])
+    print(f"2 个多米诺 -> 状态: {res.status.value}, 高度: {res.height}, "
+          f"旋转次数: {res.rotation_count}")
+    print(render_layout(board, [domino, domino], res.placements, res.height))
+    assert res.status is Status.OPTIMAL and res.height == 1
+    # 每个宽 2 的块(高 5 行)含一格边距最多横放 3 个多米诺(y=0,2,4),
+    # 两块共 6 个; 第 7 个无处可放: 给足预算后被证明无解。
+    seven = [domino] * 7
+    full = pack(board, seven)
+    print(f"7 个多米诺(给足预算) -> 状态: {full.status.value} (已证明无解)")
+    assert full.status is Status.INFEASIBLE
+    # 同一实例预算=1: 搜索未结束, 只能报告预算耗尽, 不能说无解
+    tiny = pack(board, seven, budget=1)
+    print(f"7 个多米诺(budget=1) -> 状态: {tiny.status.value} (搜索未结束, "
+          f"下界 {tiny.lower_bound})")
+    assert tiny.status is Status.BUDGET_EXHAUSTED
+
+
 def main():
     t0 = time.perf_counter()
     demo_normal()
     demo_rejection()
     demo_budget()
+    demo_damage_wall()
     print("=" * 56)
     print(f"演示总耗时: {time.perf_counter() - t0:.2f} s")
 

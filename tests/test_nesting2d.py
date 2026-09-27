@@ -208,6 +208,173 @@ class TestRotationOnlyFit(unittest.TestCase):
 class TestInfeasible(unittest.TestCase):
     """不可行: 3x3 板放 5 个单格(边距下最多 4 个)。"""
 
+
+class TestDamagedRegions(unittest.TestCase):
+    """损坏区域(禁放格): 连通边界、分割剩余空间的损坏墙必须正确处理。
+
+    求解器不假设可用空间连通: 每个候选放置逐格检查损坏掩码,
+    因此损坏墙把板材分成多个连通块时, 零件只能落在各块内部。
+    """
+
+    def check(self, board, parts, allow_reflection=True):
+        res = pack(board, parts, allow_reflection=allow_reflection)
+        ref = _reference.solve(board, parts, allow_reflection=allow_reflection)
+        if ref is None:
+            self.assertEqual(res.status, Status.INFEASIBLE)
+            self.assertIsNone(res.height)
+            self.assertEqual(res.lower_bound, board.height + 1)
+            return
+        self.assertEqual(res.status, Status.OPTIMAL)
+        self.assertEqual((res.height, res.rotation_count), (ref[0], ref[1]))
+        self.assertEqual(
+            tuple(res.layout[i] for i in sorted(res.layout)), ref[3]
+        )
+        self.assertEqual(
+            verify_layout(board, parts, res.placements, res.height), []
+        )
+
+    def test_vertical_wall_splits_board(self):
+        # 损坏柱 (2, y) 从底边贯穿到顶边, 把 5x5 板切成宽 2 的两个块
+        # (右侧块为 x=3,4)。两个多米诺只能分别落在两块内。
+        wall = [(2, y) for y in range(5)]
+        board = Board(5, 5, forbidden=wall)
+        parts = [domino(), domino()]
+        res = pack(board, parts)
+        self.assertEqual(res.status, Status.OPTIMAL)
+        self.assertEqual(res.height, 1)
+        for pl in res.placements:
+            self.assertIn(pl.x, (0, 3))  # 只能落在损坏墙两侧的两个连通块
+        self.assertEqual(verify_layout(board, parts, res.placements, 1), [])
+        ref = _reference.solve(board, parts)
+        self.assertEqual((ref[0], ref[1]), (1, 0))
+
+    def test_wall_makes_placement_infeasible(self):
+        # 两侧损坏柱把中间 x=2 隔成宽 1 的竖条: 单格可放, 多米诺只能
+        # 竖放(需要旋转); 禁用旋转后多米诺不可行 -> 已证明无解。
+        wall = [(1, y) for y in range(4)] + [(3, y) for y in range(4)]
+        board = Board(5, 4, forbidden=wall)
+        bar = Part([(0, 0), (1, 0)], rotations=(0,))
+        res = pack(board, [bar])
+        self.assertEqual(res.status, Status.INFEASIBLE)
+        self.assertIsNone(res.height)
+        self.assertEqual(res.lower_bound, 5)
+        self.assertIsNone(_reference.solve(board, [bar]))
+
+    def test_wall_forces_rotation(self):
+        # 竖放多米诺可落在 x=0/2/4 任一单格列; 字典序取 x=0, 旋转次数 1。
+        wall = [(1, y) for y in range(4)] + [(3, y) for y in range(4)]
+        board = Board(5, 4, forbidden=wall)
+        bar = Part([(0, 0), (1, 0)], rotations=(0, 90))
+        res = pack(board, [bar])
+        self.assertEqual(res.status, Status.OPTIMAL)
+        self.assertEqual(res.height, 2)
+        self.assertEqual(res.rotation_count, 1)
+        self.assertEqual(res.layout[0], (0, 0, 90, False))
+
+    def test_horizontal_wall_from_edge(self):
+        # 损坏行 (x, 2) 从左边界延伸到右边界: 板被切成上下两块,
+        # 2x2 方块只能放在其中一块, 两块都恰好容纳。
+        wall = [(x, 2) for x in range(5)]
+        board = Board(5, 3, forbidden=wall)
+        square = Part([(0, 0), (1, 0), (0, 1), (1, 1)], rotations=(0,))
+        self.check(board, [square])
+
+    def test_two_squares_one_per_component(self):
+        # 竖墙两侧各放一个 2x2 方块: 跨块放置不可能。板高 3 时
+        # 每个宽 2 的块内(含一格边距)只能容纳一个 2x2 方块。
+        wall = [(2, y) for y in range(3)]
+        board = Board(5, 3, forbidden=wall)
+        square = Part([(0, 0), (1, 0), (0, 1), (1, 1)], rotations=(0,))
+        self.check(board, [square, square])
+        # 第三个方块无处可放(每块宽 2, 同一块内两个方块需边距): 无解
+        res3 = pack(board, [square, square, square])
+        self.assertEqual(res3.status, Status.INFEASIBLE)
+        self.assertIsNone(_reference.solve(board, [square, square, square]))
+
+    def test_damage_at_height_boundary(self):
+        # 损坏格位于高处: 最小高度解使用的底部区域必须避开它;
+        # 同时验证 _forbidden_mask 只计底部 h 行(高处损坏不影响低高度枚举)。
+        board = Board(4, 5, forbidden=[(0, 4)])
+        parts = [monomino(), monomino()]
+        self.check(board, parts)
+
+    def test_budget_not_confused_with_infeasible_damage(self):
+        # 损坏墙造成的紧空间实例: 预算耗尽时即使实际无解也只能报
+        # BUDGET_EXHAUSTED, 绝不报告 INFEASIBLE。
+        # 三堵损坏柱只留下 x=0 与 x=4 两条单格列, 每列最多竖放 2 个
+        # 多米诺(边距一格) => 4 个可行, 5 个已证明无解。
+        wall = [(1, y) for y in range(5)] + [(2, y) for y in range(5)] \
+            + [(3, y) for y in range(5)]
+        board = Board(5, 5, forbidden=wall)
+        parts = [domino()] * 5
+        res = pack(board, parts, budget=1)
+        self.assertEqual(res.status, Status.BUDGET_EXHAUSTED)
+        self.assertEqual(res.lower_bound, 2)
+        # 给足预算后该实例被证明不可行: 两种状态严格区分
+        full = pack(board, parts)
+        self.assertEqual(full.status, Status.INFEASIBLE)
+
+    def test_random_damaged_boards_cross_check(self):
+        # 随机损坏(含从边界生长的连通损坏区)与独立穷举参考交叉验证
+        rng = random.Random(60)
+
+        def random_shape():
+            cells = {(0, 0)}
+            target = rng.randint(1, 5)
+            while len(cells) < target:
+                x, y = rng.choice(sorted(cells))
+                cells.add(
+                    rng.choice([(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)])
+                )
+            return sorted(cells)
+
+        for trial in range(60):
+            w = rng.randint(3, 6)
+            h = rng.randint(3, 6)
+            n = rng.randint(1, 3)
+            parts = []
+            for _ in range(n):
+                rots = tuple(
+                    r for r in (0, 90, 180, 270) if rng.random() < 0.7
+                ) or (0,)
+                parts.append(
+                    Part(
+                        random_shape(),
+                        rotations=rots,
+                        allow_reflection=rng.random() < 0.5,
+                    )
+                )
+            if rng.random() < 0.6:
+                # 从边界生长的连通损坏区(常把剩余空间切成多块)
+                forb = set()
+                seed = rng.choice(
+                    [(rng.randrange(w), 0), (rng.randrange(w), h - 1),
+                     (0, rng.randrange(h)), (w - 1, rng.randrange(h))]
+                )
+                stack = [seed]
+                while stack and len(forb) < w * h // 3:
+                    x, y = stack.pop()
+                    forb.add((x, y))
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nx, ny = x + dx, y + dy
+                        if (
+                            0 <= nx < w and 0 <= ny < h
+                            and (nx, ny) not in forb and rng.random() < 0.4
+                        ):
+                            stack.append((nx, ny))
+                forbidden = sorted(forb)
+            else:
+                forbidden = [
+                    (x, y)
+                    for x in range(w) for y in range(h)
+                    if rng.random() < 0.12
+                ]
+            if len(forbidden) >= w * h - 1:
+                continue
+            board = Board(w, h, forbidden=forbidden)
+            with self.subTest(trial=trial, w=w, h=h, n=n):
+                self.check(board, parts, allow_reflection=rng.random() < 0.5)
+
     def test_five_monominoes(self):
         board = Board(3, 3)
         parts = [monomino()] * 5
