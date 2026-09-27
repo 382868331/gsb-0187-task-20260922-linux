@@ -225,6 +225,81 @@ class TestInfeasible(unittest.TestCase):
         self.assertEqual(verify_layout(board, parts, res.placements, res.height), [])
 
 
+class TestDamagedBoard(unittest.TestCase):
+    """损坏区域: 连边分割剩余空间、死角、切碎无解。"""
+
+    def test_vertical_wall_splits_corridors(self):
+        # x=2 整列损坏, 上下连边, 把 5x6 板切成两条宽 2 走廊;
+        # 1x3 长条只能竖放(90 度)进入走廊, 两条各一件, 高度 3。
+        board = Board(5, 6, forbidden=[(2, y) for y in range(6)])
+        bar = Part([(0, 0), (1, 0), (2, 0)], rotations=(0, 90))
+        res = pack(board, [bar, bar])
+        self.assertEqual(res.status, Status.OPTIMAL)
+        self.assertEqual(res.height, 3)
+        self.assertEqual(res.rotation_count, 2)
+        self.assertEqual(
+            verify_layout(board, [bar, bar], res.placements, res.height), []
+        )
+        ref = _reference.solve(board, [bar, bar])
+        self.assertEqual((ref[0], ref[1]), (3, 2))
+
+    def test_horizontal_wall_connected_to_edges(self):
+        # y=2 整行损坏, 左右连边, 分成上下两区; 横放长条分别进入两区,
+        # 使用高度必须越过损坏行 => 高度 4。
+        board = Board(6, 5, forbidden=[(x, 2) for x in range(6)])
+        bar = Part([(0, 0), (1, 0), (2, 0)], rotations=(0, 90))
+        res = pack(board, [bar, bar])
+        self.assertEqual(res.status, Status.OPTIMAL)
+        self.assertEqual(res.height, 4)
+        self.assertEqual(res.rotation_count, 0)
+        self.assertEqual(
+            verify_layout(board, [bar, bar], res.placements, res.height), []
+        )
+
+    def test_damage_fragments_into_infeasible(self):
+        # 横墙 + 中央竖格, 剩余空间没有任何可容纳 1x3(任意允许旋转)的位置。
+        forbidden = [(x, 2) for x in range(5)] + [
+            (2, 0), (2, 1), (2, 3), (2, 4)
+        ]
+        board = Board(5, 5, forbidden=forbidden)
+        bar = Part([(0, 0), (1, 0), (2, 0)], rotations=(0, 90))
+        res = pack(board, [bar])
+        self.assertEqual(res.status, Status.INFEASIBLE)
+        self.assertIsNone(res.height)
+        self.assertEqual(res.lower_bound, 6)
+        self.assertIsNone(_reference.solve(board, [bar]))
+
+    def test_dead_end_pocket_still_packed(self):
+        # 竖墙连底边把左侧封成宽 2 死角, 零件必须放在另一侧连通区;
+        # 结果与独立穷举一致, 对称破缺不得因分割漏解。
+        board = Board(
+            5, 5, forbidden=[(2, y) for y in range(5)] + [(1, 4)]
+        )
+        bar = Part([(0, 0), (1, 0), (2, 0)], rotations=(0, 90))
+        res = pack(board, [bar, bar])
+        self.assertEqual(res.status, Status.OPTIMAL)
+        self.assertEqual(
+            verify_layout(board, [bar, bar], res.placements, res.height), []
+        )
+        ref = _reference.solve(board, [bar, bar])
+        self.assertIsNotNone(ref)
+        self.assertEqual((res.height, res.rotation_count), (ref[0], ref[1]))
+
+    def test_budget_exhausted_distinct_from_infeasible_on_damaged_board(self):
+        # 同一损坏板: 极小预算报告 BUDGET_EXHAUSTED(即使尚未找到解),
+        # 给足预算后证明 OPTIMAL; 两种报告不得混淆。
+        board = Board(5, 5, forbidden=[(4, 4), (0, 0)])
+        parts = [monomino()] * 4
+        tiny = pack(board, parts, budget=1)
+        self.assertEqual(tiny.status, Status.BUDGET_EXHAUSTED)
+        self.assertIsNone(tiny.height)
+        full = pack(board, parts)
+        self.assertEqual(full.status, Status.OPTIMAL)
+        self.assertEqual(
+            verify_layout(board, parts, full.placements, full.height), []
+        )
+
+
 class TestTieBreaks(unittest.TestCase):
     def test_rotation_count_minimized(self):
         # 两个多米诺在 4x2 板上: 高度 2 的最少旋转方案是 1 次
